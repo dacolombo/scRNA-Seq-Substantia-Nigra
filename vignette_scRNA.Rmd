@@ -1,0 +1,278 @@
+---
+title: "scRNA-seq analysis of Human Substantia Nigra"
+date: "`r Sys.Date()`"
+author: "Daniele Colombo"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=FALSE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+options(max.print=10000)
+```
+
+```{r, wd, echo=FALSE}
+setwd("/home/daniele/Documenti/BCG/Trascriptomics/Project/single_cell/")
+```
+
+# Introduction
+In this report, a scRNA-Seq analysis is described. The sample used in the analysis comes from
+human substantia nigra, and it's one of the datasets studied in "*Single-cell multi-omic integration compares and contrasts features of brain cell identity*" (Welch et al. 2019) to evaluate the LIGER
+algorithm for modeling single-cell datasets.
+The dataset is stored in PanglaoDB ([SRA850958](https://panglaodb.se/view_data.php?sra=SRA850958&srs=SRS4386111)) and was
+obtained through Illumina NovaSeq 6000 and the 10X chromium protocol.
+The main steps for the scRNA-Seq analysis follows the [Seurat vignette](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html) containing the clustering
+tutorial.
+
+## Used packages
+The main packages used for this analysis are from the following attached packages:
+```{r, libraries}
+library(Seurat)
+library(dplyr)
+library(patchwork)
+library(tidyverse)
+library(umap)
+```
+
+
+# Data loading and preprocessing
+After downloading the data from PanglaoDB, it is imported in R and only the gene names are
+kept as row names:
+```{r, import}
+data <- get(load("SRA850958_SRS4386111.sparse.RData"))
+rownames(data) <- gsub("_ENS.*","",rownames(data))
+```
+
+The loaded data is converted into a SeuratObject in order to then proceed with the
+analysis steps:
+```{r, seuratobj}
+sn <- CreateSeuratObject(counts=data, project="s. nigra", min.cells=3, min.features=200)
+sn
+```
+
+
+# Quality control and filtering
+The main parameters that are checked for quality control are:
+
+* Percentage of mitochondrial reads: cells with a too high percentage of mt reads need to
+be removed, as this could be an index of damaged cells.
+* Unique gene counts (number of features): cells with either too little or too much genes expressed
+need to be removed, as they may be low quality cells or doublets respectively.
+* Read counts: similar to gene counts.
+
+While the number of genes and reads is automatically computed in the SeuratObject, the percentage
+of mitochondrial reads needs to be computed and added as metadata:
+```{r, mito}
+sn[["percent.mt"]] <- PercentageFeatureSet(sn, pattern="^MT-") # compute percentage of mt genes
+sn@meta.data
+```
+
+In order to evaluate the distribution of the aforementioned variables, the following plots
+are produced:
+```{r, violins, fig.show="hold", out.width="33%", fig.height=12}
+VlnPlot(sn, features= "nFeature_RNA", pt.size=0)
+VlnPlot(sn, features="nCount_RNA", pt.size=0)
+VlnPlot(sn, features="percent.mt", pt.size=0, y.max=15)
+```
+
+By observing the data, some thresholds are applied to remove cells that have:
+
+* A number of unique genes expressed lower than 200 or higher than 3500;
+* A percentage of mitochondrial genes higher than 8.
+
+```{r, filering-plots, fig.show="hold", out.width="50%", fig.height=8}
+FeatureScatter(sn, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+  geom_hline(yintercept=8, colour="red")
+FeatureScatter(sn, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  geom_hline(yintercept=3500, colour="red") +
+  geom_hline(yintercept=200, colour="red")
+```
+
+```{r, filtering}
+sn <- subset(sn, subset = nFeature_RNA > 200 & nFeature_RNA < 3500 & percent.mt < 8)
+sn
+```
+
+6644 cells are left after filtering.
+
+
+# Normalization
+After filtering cells the data is normalized with a global scaling normalization. The default
+normalization of Seurat (a log-normalization) normalizes the feature expression measurements
+for each cell by the total expression, multiplies it by a scale factor (10,000 by default),
+and log-transforms the result.
+```{r, normalization}
+sn <- NormalizeData(sn)
+```
+
+
+# Feature selection
+For downstream analysis, only a subset of the most variable (and therefore most informative)
+genes is selected. The top 2000 variable features are selected:
+```{r, selection}
+sn <- FindVariableFeatures(sn, selection.method = "vst", nfeatures=2000)
+top10 <- head(VariableFeatures(sn),10)
+paste("The top 10 variable genes are:", paste(top10, collapse=", "))
+```
+
+The selected features are shown in red in the following plot, and the top 10 variable ones
+are labeled with their corresponding gene symbol:
+```{r, selection-plot}
+plot <- VariableFeaturePlot(sn)
+LabelPoints(plot = plot, points = top10, repel = TRUE, xnudge=0, ynudge=0)
+```
+
+
+# Data scaling
+The counts are then scaled in order to have:
+
+* Mean expression of each gene equal to 0
+* Variance of the expression of each gene equal to 1
+
+In this way, all the data will have a tendency to a ternary signature: for each cell, a gene
+can be considered as up-regulated (counts > 0), down-regulated (counts < 0) or with average
+expression (counts = 0).
+This scaling is necessary for the following steps of dimensionality reduction and clustering.
+
+```{r, scaling, cache=TRUE}
+sn <- ScaleData(sn, features=rownames(sn))
+```
+
+In the scaling step, it can be possible to regress out some variables from the result, in
+order to remove some biases that may be caused by them. This step is usually used to remove
+unwanted variability between cells that is caused by the cell cycle effect.
+In order to evaluate if this step is necessary:
+
+* Each cell is assigned to its predicted cell cycle phase based on the expression of phase
+specific genes;
+* The cells are then plotted in a lower dimensionality space to evaluate if they cluster
+based on the predicted cell cycle.
+```{r, cell-cycle}
+# Cell phase prediction
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+sn <- CellCycleScoring(sn, s.features=s.genes, g2m.features=g2m.genes, set.ident=TRUE)
+
+# Linear dimensionality reduction with PCA
+sn <- RunPCA(sn, features=VariableFeatures(object=sn))
+
+# Visualization in a lower dimensionality space
+DimPlot(sn, reduction="pca")
+```
+
+From the previous plot, we can observe that there seems to be no clear separation between
+cells based on cell cycle phase. In this case, it's not necessary to regress out cell cycle.
+
+
+# Dimensionality determination
+In order to perform an effective clustering to classify cells, an appropriate number of
+principal components needs to be chosen. The choice is made so that the number of PC used
+is the minimum one that allows to describe the data variability as completely as possible.
+In order to evaluate which could be the best number of PC, the elbow plot is used, which
+plots the standard deviation explained by each component:
+```{r, elbow}
+ElbowPlot(sn, ndims=50) +
+  geom_vline(colour="red",xintercept = 18)
+```
+
+As represented by the red line, the optimal number of PC seems to be 18, as after that
+number there is no significant variation in the explained variability (so most probably
+the following principal components don't add much information).
+
+Even if 18 seems to be the best choice, different numbers of principal components were also
+used for the following clustering steps. In the end, 18 seemed to give the best results.
+
+
+# UMAP Clustering
+Seurat uses a kNN graph-based clustering using as metric the euclidean distance in the
+chosen PC space.
+To cluster the cells, two steps are applied:
+
+* First, the kNN graph is built with the function `FindNeighbors()`, to which the number of
+PC is passed.
+* Then, cells are divided into clusters through modularity optimization techniques (such as
+the Louvain algorithm) with the function `FindClusters()`, to which the resolution parameter
+is passed (indicating the granularity wanted for the clusters).
+
+```{r, clustering, message=FALSE, cache=TRUE}
+sn <- FindNeighbors(sn, dims=1:18)
+sn <- FindClusters(sn, resolution=0.5)
+```
+
+PCA visualization is not the best method for showing cluster of cells based on scRNA data.
+UMAP is usually used instead, which is a non-linear dimensionality reduction method.
+In order to visualize the data with UMAP dimensionality reduction, the function `RunUMAP()`
+from the package `umap` is used.
+The resulting clustering can then be plotted selecting the appropriate reduction method:
+```{r, clustering-plot, cache=TRUE}
+sn <- RunUMAP(sn, dims=1:18)
+DimPlot(sn, reduction = "umap")
+```
+
+
+# Cluster markers
+Through differential expression analysis, it's possible to identify the genes that best
+define each cluster. The function `FindAllMarkers()` allows to find the DE genes for all
+the clusters,
+```{r, markers, cache=TRUE}
+sn <- BuildClusterTree(sn)
+sn.markers <- FindAllMarkers(sn, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+cluster_genes <- sn.markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+cluster_genes
+```
+
+For each cluster, it is possible to visualize the specificity of a marker gene to the cluster
+in which it's differentially expressed. In order to do that, two types of plots are useful:
+
+* Violinplots showing the distribution of gene expression for each cell in each cluster.
+* An heatmap showing in the UMAP plot directly how much a gene is expressed in each cluster.
+```{r, marker-visualization, fig.height=15}
+VlnPlot(sn, features = c("IQCA1", "STMN4","CERCAM","KLK6","OPALIN","CSF3R","VCAN",
+                         "SYT1","FLT1","HIGD1B"), pt.size=0, ncol=2)
+
+FeaturePlot(sn, features = c("IQCA1", "STMN4","CERCAM","KLK6","OPALIN","CD74","VCAN",
+                               "SYT1","FLT1","HIGD1B"), ncol=2)
+```
+
+
+# Cell type assignment
+By manually searching for the marker genes expression in [PanglaoDB search](https://panglaodb.se/search.html)
+and in the literature, a cell type is assigned to each of the clusters.
+The result of this analysis can be seen in the UMAP plot by changing the cluster labels:
+```{r, cluster-labels}
+new.cluster.ids <- c("Astrocytes", rep("Oligodendrocytes",4), "Microglia",
+                     "OPC","Neurons", "Endothelial cells", "Pericytes")
+names(new.cluster.ids) <- levels(sn)
+sn <- RenameIdents(sn, new.cluster.ids)
+DimPlot(sn, reduction="umap",label=TRUE, pt.size=0.5) + NoLegend()
+# Show the number of cells inside each cluster
+summary(sn[["seurat_clusters"]], maxsum=10)
+```
+
+With this last plot, it's possible to see that the different population are well clustered,
+showing a similar clustering to the ones reported in PanglaoDB and in the reference article.
+
+
+# Session info
+```{r, session-info, echo=FALSE}
+print(sessionInfo(), nrow=(1000))
+
+```
+
+
+
